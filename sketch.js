@@ -1,10 +1,13 @@
 // Гра-клацалка на p5.js
 // Петля взаємодії: клік/клавіша (input) → зміна стану (processing) → реакція на екрані (feedback)
 //
+// Гравець — синє коло, що йде за курсором миші.
+// Червоний ворог переслідує гравця; торкнувся — гра закінчена.
+//
 // Керування:
-//   клік по мішені            → +1 бал
-//   перетягнути мішень у кошик → +3 бали (drag починається лише після зсуву > SLOP px)
-//   стрілки ← ↑ → ↓            → рухають мішень так само, як drag (клавіатурна альтернатива)
+//   клік по монеті             → +1 бал
+//   перетягнути монету у кошик → +3 бали (drag починається лише після зсуву > SLOP px)
+//   стрілки ← ↑ → ↓            → рухають монету так само, як drag (клавіатурна альтернатива)
 //   SPACE                      → старт / пауза / продовжити / нова гра
 
 const GAME_TIME = 30;            // тривалість раунду, секунд
@@ -12,7 +15,13 @@ const BEST_KEY = 'clicker-best'; // ключ для збереження рек�
 const SLOP = 8;                  // просторовий поріг drag, px
 const KEY_STEP = 6;              // крок руху стрілками, px
 const KEY_INTERVAL = 30;         // throttle для стрілок: не частіше ніж раз на 30 мс
-const BONUS = 3;                 // бали за доставку мішені в кошик
+const BONUS = 3;                 // бали за доставку монети в кошик
+
+const ENEMY_SPEED = 120;         // початкова швидкість ворога, px/сек
+const ENEMY_SPEED_STEP = 10;     // +10 px/сек ...
+const ENEMY_SPEED_EVERY = 5;     // ... за кожні 5 очок
+const ENEMY_R = 16;              // радіус ворога
+const PLAYER_R = 10;             // радіус гравця
 
 // Стан гри: 'idle' (старт), 'playing', 'paused', 'over'
 let state = 'idle';
@@ -21,17 +30,20 @@ let best = 0;
 let timeLeft = GAME_TIME;
 let lastMillis = 0;
 let newRecord = false;
+let caught = false;              // чим закінчилась гра: ворог зловив чи вийшов час
 
-// Мішень і її власний скінченний автомат (FSM):
+// Монета і її власний скінченний автомат (FSM):
 // 'idle' → 'hover' → 'pressed' → 'dragging' → 'dropped' → 'idle'
 let target = { x: 0, y: 0, r: 40 };
 let targetState = 'idle';
 let pressX = 0, pressY = 0;      // де натиснули (для порогу SLOP)
-let grabDX = 0, grabDY = 0;      // зсув курсора від центру мішені, щоб вона не "стрибала"
+let grabDX = 0, grabDY = 0;      // зсув курсора від центру монети, щоб вона не "стрибала"
 let droppedAt = 0;               // час переходу в 'dropped'
 
+let enemy = { x: 0, y: 0 };      // ворог-переслідувач
 let basket;                      // зона-кошик для drag & drop
 let effects = [];                // візуальні ефекти
+let audioCtx = null;             // Web Audio для звуків
 
 function setup() {
   const c = createCanvas(600, 400);
@@ -40,6 +52,7 @@ function setup() {
   basket = { x: width - 130, y: height - 116, w: 114, h: 100 };
   best = loadBest();
   moveTarget();
+  spawnEnemy();
 }
 
 function draw() {
@@ -51,33 +64,81 @@ function draw() {
     lastMillis = now;
     if (timeLeft <= 0) {
       timeLeft = 0;
-      endGame();
+      endGame(false);
     }
   }
 
-  if (state === 'playing') updateTarget();
+  if (state === 'playing') {
+    updateTarget();
+    updateEnemy();
+  }
 
   drawBasket();
   drawHUD();
 
-  if (state === 'playing') {
+  if (state === 'playing' || state === 'paused') {
     drawTarget();
-  } else if (state === 'paused') {
-    drawTarget();
+    drawPlayer();
+    drawEnemy();
+  }
+  if (state === 'paused') {
     drawOverlay('ПАУЗА', 'SPACE — продовжити');
   } else if (state === 'idle') {
     drawOverlay('ГРА-КЛАЦАЛКА',
-      'Клік по мішені: +1 • Перетягни в кошик: +' + BONUS +
-      '\nСтрілки рухають мішень • SPACE — старт / стоп');
+      'Збирай монети: клік +1, у кошик +' + BONUS +
+      '\nТікай курсором від червоного ворога • SPACE — старт');
   } else if (state === 'over') {
-    const title = newRecord ? 'НОВИЙ РЕКОРД!' : 'ЧАС ВИЙШОВ';
-    drawOverlay(title, 'Твій результат: ' + score + '\nSPACE — грати ще раз');
+    const title = caught ? 'ТЕБЕ ЗЛОВИЛИ!' : 'ЧАС ВИЙШОВ';
+    const rec = newRecord ? ' — новий рекорд!' : '';
+    drawOverlay(title, 'Твій результат: ' + score + rec + '\nSPACE — грати ще раз');
   }
 
   drawEffects();
 }
 
-// ---------- Оновлення стану мішені (вся "важка" логіка тут, а не в обробниках) ----------
+// ---------- Ворог ----------
+
+function enemySpeed() {
+  // 120 px/сек + 10 px/сек за кожні повні 5 очок
+  return ENEMY_SPEED + ENEMY_SPEED_STEP * floor(score / ENEMY_SPEED_EVERY);
+}
+
+function playerPos() {
+  // Гравець — там, де курсор, але не за межами поля
+  return { x: constrain(mouseX, 0, width), y: constrain(mouseY, 0, height) };
+}
+
+function updateEnemy() {
+  const p = playerPos();
+  const d = dist(enemy.x, enemy.y, p.x, p.y);
+  // deltaTime — мс від попереднього кадру; обмежуємо, щоб після згортання вкладки ворог не "телепортувався"
+  const step = enemySpeed() * min(deltaTime, 50) / 1000;
+  if (d > 0) {
+    const k = min(step, d) / d;
+    enemy.x += (p.x - enemy.x) * k;
+    enemy.y += (p.y - enemy.y) * k;
+  }
+  if (dist(enemy.x, enemy.y, p.x, p.y) < ENEMY_R + PLAYER_R) {
+    endGame(true);
+  }
+}
+
+function spawnEnemy() {
+  // Ворог з'являється в куті, найдальшому від гравця
+  const p = playerPos();
+  const corners = [
+    { x: 30, y: 70 }, { x: width - 30, y: 70 },
+    { x: 30, y: height - 30 }, { x: width - 30, y: height - 30 },
+  ];
+  let far = corners[0];
+  for (const c of corners) {
+    if (dist(c.x, c.y, p.x, p.y) > dist(far.x, far.y, p.x, p.y)) far = c;
+  }
+  enemy.x = far.x;
+  enemy.y = far.y;
+}
+
+// ---------- Оновлення стану монети (вся "важка" логіка тут, а не в обробниках) ----------
 
 function updateTarget() {
   const over = isOverTarget(mouseX, mouseY);
@@ -85,7 +146,7 @@ function updateTarget() {
   if (targetState === 'idle' && over) targetState = 'hover';
   else if (targetState === 'hover' && !over) targetState = 'idle';
 
-  // Dragging: мішень іде за курсором
+  // Dragging: монета йде за курсором
   if (targetState === 'dragging' && mouseIsPressed) {
     target.x = constrain(mouseX + grabDX, target.r, width - target.r);
     target.y = constrain(mouseY + grabDY, 50 + target.r, height - 10 - target.r);
@@ -113,7 +174,7 @@ const moveByKeys = throttle(() => {
   if (keyIsDown(DOWN_ARROW))  dy += KEY_STEP;
   target.x = constrain(target.x + dx, target.r, width - target.r);
   target.y = constrain(target.y + dy, 50 + target.r, height - 10 - target.r);
-  // Мішень доїхала стрілками до кошика → це той самий Drop, що й мишею
+  // Монета доїхала стрілками до кошика → це той самий Drop, що й мишею
   if (inBasket()) dropTarget();
 }, KEY_INTERVAL);
 
@@ -121,6 +182,7 @@ function dropTarget() {
   if (inBasket()) {
     score += BONUS;
     addEffect(target.x, target.y, '+' + BONUS, true);
+    playCoin(true);
     moveTarget();
   }
   targetState = 'dropped';
@@ -144,13 +206,19 @@ function drawHUD() {
   textAlign(RIGHT, TOP);
   text('Рекорд: ' + best, width - 16, 14);
 
+  // Поточна швидкість ворога
+  fill(120);
+  textSize(13);
+  textAlign(LEFT, BOTTOM);
+  text('Ворог: ' + enemySpeed() + ' px/с', 16, height - 14);
+
   const w = map(timeLeft, 0, GAME_TIME, 0, width);
   fill(255, 120, 60);
   rect(0, height - 6, w, 6);
 }
 
 function drawBasket() {
-  // Під час перетягування кошик підсвічується, а коли мішень над ним — ще яскравіше
+  // Під час перетягування кошик підсвічується, а коли монета над ним — ще яскравіше
   const dragging = targetState === 'dragging' && state === 'playing';
   const hot = dragging && inBasket();
   strokeWeight(2);
@@ -165,7 +233,7 @@ function drawBasket() {
 }
 
 function drawTarget() {
-  // Вигляд залежить від стану FSM
+  // Монета; вигляд залежить від стану FSM
   let k = 1;
   if (targetState === 'hover') k = 1.08;
   if (targetState === 'pressed') k = 0.94;
@@ -177,12 +245,34 @@ function drawTarget() {
     fill(0, 0, 0, 40);
     circle(target.x + 6, target.y + 8, r * 2);
   }
-  fill(220, 50, 50);
+  stroke(190, 130, 20);
+  strokeWeight(3);
+  fill(245, 195, 50);
   circle(target.x, target.y, r * 2);
-  fill(255);
+  noFill();
+  strokeWeight(2);
+  stroke(255, 225, 120);
   circle(target.x, target.y, r * 1.35);
-  fill(220, 50, 50);
-  circle(target.x, target.y, r * 0.7);
+  noStroke();
+  fill(190, 130, 20);
+  textAlign(CENTER, CENTER);
+  textSize(r * 0.9);
+  text('$', target.x, target.y + 1);
+}
+
+function drawPlayer() {
+  const p = playerPos();
+  stroke(255);
+  strokeWeight(2);
+  fill(40, 110, 230);
+  circle(p.x, p.y, PLAYER_R * 2);
+}
+
+function drawEnemy() {
+  stroke(150, 20, 20);
+  strokeWeight(2);
+  fill(225, 40, 40);
+  circle(enemy.x, enemy.y, ENEMY_R * 2);
 }
 
 function drawOverlay(title, subtitle) {
@@ -207,7 +297,7 @@ function drawEffects() {
     e.life -= 1;
     const a = map(e.life, 0, 30, 0, 255);
     noFill();
-    stroke(e.bonus ? color(30, 150, 60, a) : color(220, 50, 50, a));
+    stroke(e.bonus ? color(30, 150, 60, a) : color(230, 170, 30, a));
     strokeWeight(3);
     circle(e.x, e.y, e.size + (30 - e.life) * 3);
     noStroke();
@@ -219,14 +309,53 @@ function drawEffects() {
   }
 }
 
+// ---------- Звук (Web Audio, без додаткових бібліотек) ----------
+
+function ensureAudio() {
+  // Браузер дозволяє звук лише після дії користувача, тому створюємо його на клік/клавішу
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) {
+    audioCtx = null;
+  }
+}
+
+function beep(freqs, type, duration, volume) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  freqs.forEach((f, i) => osc.frequency.setValueAtTime(f, t + i * duration / freqs.length));
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(volume, t + 0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + duration + 0.02);
+}
+
+function playCoin(big) {
+  // Короткий "дзень": дві ноти вгору; для кошика — вища
+  beep(big ? [1047, 1568] : [988, 1319], 'square', 0.16, 0.12);
+}
+
+function playCaught() {
+  beep([330, 220, 147], 'sawtooth', 0.4, 0.15);
+}
+
 // ---------- Логіка гри ----------
 
 function startGame() {
   score = 0;
   timeLeft = GAME_TIME;
   newRecord = false;
+  caught = false;
   effects = [];
   moveTarget();
+  spawnEnemy();
   resumeGame();
 }
 
@@ -236,10 +365,12 @@ function resumeGame() {
   lastMillis = millis();
 }
 
-function endGame() {
+function endGame(wasCaught) {
   state = 'over';
+  caught = wasCaught;
   targetState = 'idle';
   cursor(ARROW);
+  if (wasCaught) playCaught();
   if (score > best) {
     best = score;
     newRecord = true;
@@ -268,6 +399,7 @@ function inBasket() {
 // ---------- Обробники подій: короткі, лише змінюють стан ----------
 
 function mousePressed() {
+  ensureAudio();
   if (state !== 'playing' || !isOverTarget(mouseX, mouseY)) return;
   targetState = 'pressed';
   pressX = mouseX;
@@ -289,6 +421,7 @@ function mouseReleased() {
     // Відпустили без перетягування → це клік: +1
     score += 1;
     addEffect(target.x, target.y, '+1', false);
+    playCoin(false);
     moveTarget();
     targetState = 'idle';
   } else if (targetState === 'dragging') {
@@ -298,6 +431,7 @@ function mouseReleased() {
 
 function keyPressed() {
   if (key === ' ') {
+    ensureAudio();
     if (state === 'idle' || state === 'over') startGame();
     else if (state === 'playing') { state = 'paused'; targetState = 'idle'; }
     else if (state === 'paused') resumeGame();
